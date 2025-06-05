@@ -11,8 +11,11 @@ from dataset import TimingDataset
 from model import FiringRateRNN
 from torch.utils.data import Dataset, DataLoader, Subset
 from dataset import build_index_with_kfold, get_fold_dataloaders, collate_variable_length
+from collections import defaultdict
+from scipy.stats import pearsonr
 import datetime
 import time
+from scipy.spatial import procrustes
 
 
 
@@ -142,7 +145,7 @@ def train(model, optimizer, train_loader, device, epoch, log_txt_path):
 
     total_loss = 0.0
 
-    for batch_idx, (u_batch, target_batch, set_idx_batch, dotN_batch, lengths) in enumerate(train_loader):
+    for batch_idx, (u_batch, target_batch, set_idx_batch, dotN_batch, lengths, cond) in enumerate(train_loader):
         # u_batch: (batch, T_max, 2)
         # target_batch: (batch, T_max)
         # set_idx_batch: (batch,)
@@ -195,7 +198,7 @@ def validate(model, val_loader, device, epoch, log_txt_path):
     total_loss = 0.0
 
     with torch.no_grad():
-        for batch_idx, (u_batch, target_batch, set_idx_batch, dotN_batch, lengths) in enumerate(val_loader):
+        for batch_idx, (u_batch, target_batch, set_idx_batch, dotN_batch, lengths,cond) in enumerate(val_loader):
 
             u_batch = u_batch.to(device)
             target_batch = target_batch.to(device)
@@ -219,6 +222,66 @@ def validate(model, val_loader, device, epoch, log_txt_path):
             total_loss += loss.item()
 
     return total_loss / len(val_loader)  # average loss over all batches
+
+
+
+def compute_condition_means(model, loader, device, threshold=1.0):
+    model.eval()
+    preds = defaultdict(list)
+    trues = defaultdict(list)
+
+    with torch.no_grad():
+        for batch in loader:
+            x       = batch[0].to(device)           # 输入
+            true_tp = true_tp = batch[4].cpu().numpy() - batch[2].cpu().numpy() # 真实 Tp
+            cond    = batch[5].cpu().numpy()        # condition id
+
+            # raw_out 假设 shape = (B, T)
+            raw_out = model(x).cpu().numpy()
+
+            # 把每条序列映射到一个标量：第一个超过阈值的位置
+            # 如果从未超过，就返回最后一个时间点
+            y_pred = []
+            for seq in raw_out:
+                # 找到 seq >= threshold 的所有索引
+                exceed = np.where(seq >= threshold)[0]
+                if exceed.size > 0:
+                    y_pred.append(int(exceed[0]))
+                else:
+                    y_pred.append(seq.shape[0] - 1)
+            y_pred = np.array(y_pred)  # 变成 (B,)
+
+            # 现在 y_pred, true_tp, cond 都是一维向量了
+            for p, t, c in zip(y_pred, true_tp, cond):
+                preds[int(c)].append(p)
+                trues[int(c)].append(t)
+
+    # 计算每个 condition 下的均值
+    pred_means = []
+    true_means = []
+    for i in range(max(preds.keys()) + 1):
+        if preds[i] and trues[i]:
+            pred_means.append(np.mean(preds[i]))
+            true_means.append(np.mean(trues[i]))
+    pred_means = np.array(pred_means)
+    true_means = np.array(true_means)
+    return pred_means, true_means
+
+# def condition_metric_pearson(pred_means, true_means):
+#     if len(pred_means) < 2:
+#         return np.inf
+#     r, _ = pearsonr(pred_means, true_means)
+#     return 1 - r
+
+def condition_metric_procrustes(pred_means, true_means):
+    if len(pred_means) < 2:
+        return np.inf
+    # reshape 成二维 (n, 1) 矩阵，因为 Procrustes 要求是 shape=(n, dim)
+    mtx1 = np.array(true_means).reshape(-1, 1)
+    mtx2 = np.array(pred_means).reshape(-1, 1)
+
+    _, _, disparity = procrustes(mtx1, mtx2)
+    return disparity  # 越小表示越相似
 
 
 # ================== #
@@ -252,7 +315,7 @@ def main():
         f.write("log information\n\n")
 
     # Load model and data
-    model = FiringRateRNN(hidden_size=200, input_dim=2).to(device)
+    model = FiringRateRNN(hidden_size=200, input_dim=5).to(device)
     trials_list = torch.load(config['data_path'])
     dataset = TimingDataset(trials_list, device=device)
 
@@ -267,6 +330,8 @@ def main():
     # Training
     recorder = RecorderMeter(total_epoch=config['epochs'])
     best_val_loss = float('inf')
+    best_metric = float('inf')
+    metric_list = []
 
 
     with open(log_txt_path, 'a') as f:
@@ -281,6 +346,15 @@ def main():
         f.write(f"step size: {scheduler.step_size}\n")
         f.write(f"gamma: {scheduler.gamma}\n\n")
 
+    
+    
+    
+    
+    
+    # 训练循环开始前，先初始化这两个“Best”指标
+    best_val_loss = float("inf")
+    best_metric   = float("inf")
+
     for epoch in range(config['epochs']):
 
         inf = f'******************** {epoch} ********************'
@@ -291,15 +365,66 @@ def main():
         train_loss = train(model, optimizer, train_loader, device, epoch, log_txt_path)
         val_loss = validate(model, val_loader, device, epoch, log_txt_path)
 
+        # —— 只算一次 metric，并记录 —— 
+        pred_means, true_means = compute_condition_means(model, val_loader, device)
+        metric = condition_metric_procrustes(pred_means, true_means)
+        metric_list.append(metric)
+        with open(log_txt_path, 'a') as f:
+            f.write(f"Epoch {epoch}: disparity = {metric:.4f}\n")
+
         recorder.update(epoch, train_loss, val_loss)
 
         best_model_str = ""
-        if val_loss < best_val_loss:
-            best_val_loss = val_loss
-            save_checkpoint(model, model_save_path)
-            with open(log_txt_path, 'a') as f:
-                f.write(f"Best model saved at epoch {epoch} with val_loss {val_loss:.4f}\n")
+
+        # if val_loss <= 0.03:
+        # # if val_loss < 0.01:
+        # # 只用 metric（disparity）来判断
+        #     if metric < best_metric:
+        #         best_metric = metric
+        #         save_checkpoint(model, model_save_path)
+        #         with open(log_txt_path, 'a') as f:
+        #             f.write(f"Saved by METRIC at epoch {epoch}, disparity={metric:.4f}\n")
+        #     else:
+        #         with open(log_txt_path, 'a') as f:
+        #             f.write(f"skip saving: disparity={metric:.4f} ≥ best_metric={best_metric:.4f}\n")
+        # elif val_loss < best_val_loss:
+        #     # loss ≥ 0.03 时，才考虑 loss
+        #     best_val_loss = val_loss
+        #     save_checkpoint(model, model_save_path)
+        #     with open(log_txt_path, 'a') as f:
+        #         f.write(f"Saved by LOSS at epoch {epoch}, val_loss={val_loss:.4f}\n")
+        # else:
+        #     with open(log_txt_path, 'a') as f:
+        #         f.write(f"skip saving: val_loss={val_loss:.4f} ≥ best_loss={best_val_loss:.4f}\n")
         
+        # scheduler.step()
+
+        # -------------------- 6.3改 -------------------- #
+        if val_loss > 0.03:
+                # --- loss 驱动分支 ---
+                if val_loss < best_val_loss:
+                    best_val_loss = val_loss
+                    best_metric   = metric   # 同时记录当前模型对应的 metric
+                    save_checkpoint(model, model_save_path)
+                    with open(log_txt_path, 'a') as f:
+                        f.write(f"Saved by LOSS at epoch {epoch}, val_loss={val_loss:.4f}, disparity={metric:.4f}\n")
+                else:
+                    with open(log_txt_path, 'a') as f:
+                        f.write(f"skip saving: val_loss={val_loss:.4f} ≥ best_val_loss={best_val_loss:.4f}\n")
+
+        else:
+                # --- loss ≤ 0.03，换成 metric（disparity）驱动 ---
+                if metric < best_metric:
+                    best_val_loss = val_loss
+                    best_metric   = metric
+                    save_checkpoint(model, model_save_path)
+                    with open(log_txt_path, 'a') as f:
+                        f.write(f"Saved by METRIC at epoch {epoch}, val_loss={val_loss:.4f}, disparity={metric:.4f}\n")
+                else:
+                    with open(log_txt_path, 'a') as f:
+                        f.write(f"skip saving: disparity={metric:.4f} ≥ best_metric={best_metric:.4f}\n")
+
+        # 更新学习率调度器
         scheduler.step()
 
         # Get the updated learning rate
@@ -316,7 +441,7 @@ def main():
             print(best_model_str.strip())
 
         with open(log_txt_path, 'a') as f:
-            f.write(inf + '\n')
+            # f.write(inf + '\n')
             f.write(lr_info)
             f.write(loss_info)
             if best_model_str:
