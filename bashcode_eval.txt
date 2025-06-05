@@ -1,0 +1,19 @@
+# fold 3
+
+python eval.py --model "/Users/juntao/Desktop/proj_TimePerception/model/[06-04]-[16-15]-fold3-best_model.pt" --output_file inference_stim_5c_behav_fold3.pkl --dataset "/Users/juntao/Desktop/proj_TimePerception/data/dataset_stim_5c.pt"
+
+# fold 1
+
+python eval.py --model "/Users/juntao/Desktop/proj_TimePerception/model/dataset_epoch-40_batchSize-64_initLR-00005_stepSize-15_gamma-09/[04-29]-[21-23]-fold1-best_model.pt" --output_file inference_fold1.pkl
+
+
+# fold 4
+
+python eval.py --model "/Users/juntao/Desktop/proj_TimePerception/model/dataset_epoch-40_batchSize-64_initLR-00005_stepSize-15_gamma-09/[04-29]-[22-01]-fold4-best_model.pt" --output_file inference_fold4.pkl
+
+# fold 0
+python eval.py --model "/Users/juntao/Desktop/proj_TimePerception/model/dataset_epoch-40_batchSize-64_initLR-00005_stepSize-15_gamma-09/[04-29]-[22-41]-fold0-best_model.pt" --output_file inference_fold0.pkl
+
+# fold 2
+python eval.py --model "/Users/juntao/Desktop/proj_TimePerception/model/dataset_epoch-40_batchSize-64_initLR-00005_stepSize-15_gamma-09/[04-30]-[11-10]-fold2-best_model.pt" --output_file inference_fold2.pkl
+
